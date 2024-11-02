@@ -53,9 +53,22 @@ class FFXStructureAnalyzer {
         return null;
       }
 
+      while (
+        this.position < this.buffer.length &&
+        this.buffer[this.position] === 0
+      ) {
+        this.position++;
+        offset++;
+      }
+
+      console.log(
+        `Debug at offset ${offset}: ${this.formatDebugBytes(offset)}`
+      );
+
       const type = this.readString(4);
       if (!this.isValidSectionType(type)) {
         console.warn(`Invalid section type "${type}" at offset ${offset}`);
+        console.log(`Context bytes: ${this.formatDebugBytes(offset - 8, 24)}`);
         return null;
       }
 
@@ -91,6 +104,7 @@ class FFXStructureAnalyzer {
             if (!child) break;
             section.children.push(child);
             childOffset += child.length + 8;
+            if (childOffset % 2 !== 0) childOffset++;
           }
           break;
 
@@ -100,12 +114,30 @@ class FFXStructureAnalyzer {
 
           let listChildOffset = this.position;
           const endOffset = offset + length;
+
+          console.log(
+            `Parsing LIST of type ${listType} from ${listChildOffset} to ${endOffset}`
+          );
+
           while (listChildOffset < endOffset) {
             const child = this.parseSection(listChildOffset);
-            if (!child) break;
+            if (!child) {
+              console.log(`Failed to parse child at offset ${listChildOffset}`);
+              console.log(
+                `Remaining bytes: ${this.formatDebugBytes(listChildOffset)}`
+              );
+              break;
+            }
             section.children.push(child);
             listChildOffset += child.length + 8;
+            if (listChildOffset % 2 !== 0) listChildOffset++;
           }
+          break;
+
+        case "fnam":
+          const nameData = this.buffer.slice(this.position, offset + length);
+          section.value = nameData.toString("utf8").replace(/\0+$/, "");
+          this.position = offset + length;
           break;
 
         case "tdsb":
@@ -117,9 +149,9 @@ class FFXStructureAnalyzer {
           break;
 
         case "tdmn":
-          const nameLength = length - 8;
-          if (nameLength > 0) {
-            section.value = this.readString(nameLength).replace(/\0+$/, "");
+          const menuNameLength = length - 8;
+          if (menuNameLength > 0) {
+            section.value = this.readString(menuNameLength).replace(/\0+$/, "");
           }
           break;
 
@@ -157,6 +189,41 @@ class FFXStructureAnalyzer {
           };
           break;
 
+        case "prmm":
+        case "tdxp":
+        case "tglf":
+        case "tdpf":
+          section.data = this.buffer.slice(this.position, offset + length);
+          this.position = offset + length;
+          break;
+
+        case "parn":
+          section.value = {
+            count: this.readUInt32(),
+          };
+          break;
+
+        case "tdb4":
+          section.value = {
+            value1: this.readUInt32(),
+            value2: this.readUInt32(),
+            value3: this.readUInt32(),
+            value4: this.readUInt32(),
+            ...(length > 16
+              ? {
+                  value5: this.readUInt32(),
+                  value6: this.readUInt32(),
+                  value7: this.readUInt32(),
+                  value8: this.readUInt32(),
+                }
+              : {}),
+          };
+          if (this.position < offset + length) {
+            section.data = this.buffer.slice(this.position, offset + length);
+            this.position = offset + length;
+          }
+          break;
+
         default:
           section.data = this.buffer.slice(this.position, offset + length);
           this.position = offset + length;
@@ -165,8 +232,16 @@ class FFXStructureAnalyzer {
       return section;
     } catch (error) {
       console.error(`Error parsing section at offset ${offset}:`, error);
+      console.log(`Context bytes: ${this.formatDebugBytes(offset - 8, 24)}`);
       return null;
     }
+  }
+
+  private formatDebugBytes(offset: number, length: number = 16): string {
+    const start = Math.max(0, offset);
+    const end = Math.min(this.buffer.length, start + length);
+    const bytes = this.buffer.slice(start, end);
+    return bytes.toString("hex").match(/.{2}/g)?.join(" ") || "";
   }
 
   private isValidSectionType(type: string): boolean {
@@ -187,6 +262,19 @@ class FFXStructureAnalyzer {
       "tdps",
       "tdpk",
       "tdgp",
+      "Fsld",
+      "tdsc",
+      "tdum",
+      "tdst",
+      "fnam",
+      "prmm",
+      "tdxp",
+      "tglf",
+      "tdpf",
+      "parn",
+      "tdb4",
+      "parT",
+      "sspc",
     ];
     return validTypes.includes(type);
   }
