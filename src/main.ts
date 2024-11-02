@@ -3,6 +3,52 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import { FFXWriter, FFXEffect } from "./writer";
+
+interface FFXSection {
+  type: string;
+  offset: number;
+  length: number;
+  children: FFXSection[];
+  data?: any;
+}
+
+class FFXStructureAnalyzer {
+  private buffer: Buffer;
+
+  constructor(buffer: Buffer) {
+    this.buffer = buffer;
+  }
+
+  parseSection(offset: number): FFXSection | null {
+    const type = this.buffer.slice(offset, offset + 4).toString();
+
+    // Get section length (4 bytes after type)
+    const length = this.buffer.readUInt32BE(offset + 4);
+
+    return {
+      type,
+      offset,
+      length,
+      children: this.parseChildren(offset + 8, length - 8),
+    };
+  }
+
+  private parseChildren(start: number, length: number): FFXSection[] {
+    const children: FFXSection[] = [];
+    let offset = start;
+
+    while (offset < start + length) {
+      const section = this.parseSection(offset);
+      if (!section) break;
+
+      children.push(section);
+      offset += section.length;
+    }
+
+    return children;
+  }
+}
 
 class FFXAnalyzer {
   private buffer: Buffer;
@@ -69,6 +115,38 @@ class FFXAnalyzer {
   }
 }
 
-// Usage
-const analyzer = new FFXAnalyzer("test-files/pseudo.ffx");
+// Create a test effect
+const testEffect: FFXEffect = {
+  controlName: "Test Effect",
+  matchname: "Custom/Test/Effect",
+  controlArray: [
+    {
+      name: "Slider 1",
+      type: "slider",
+      matchname: "Custom/Slider/1",
+      canHaveKeyframes: true,
+      canBeInvisible: false,
+      id: Math.floor(Math.random() * 1000000000),
+      hold: false,
+      default: 50,
+    },
+    {
+      name: "Color 1",
+      type: "color",
+      matchname: "Custom/Color/1",
+      canHaveKeyframes: true,
+      canBeInvisible: false,
+      id: Math.floor(Math.random() * 1000000000),
+      hold: false,
+      default: { red: 255, green: 0, blue: 0 },
+    },
+  ],
+};
+
+// Create and use the writer
+const writer = new FFXWriter();
+writer.writeFFX(testEffect, "output/pseudo.ffx");
+
+// Run the analyzer on the generated file
+const analyzer = new FFXAnalyzer("output/pseudo.ffx");
 analyzer.analyze();
