@@ -3,47 +3,138 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { FFXWriter, FFXEffect } from "./writer";
 
 interface FFXSection {
   type: string;
   offset: number;
   length: number;
   children: FFXSection[];
-  data?: any;
+  data?: Buffer;
+  value?: any;
 }
 
 class FFXStructureAnalyzer {
   private buffer: Buffer;
+  private position: number = 0;
 
   constructor(buffer: Buffer) {
     this.buffer = buffer;
   }
 
-  parseSection(offset: number): FFXSection | null {
-    const type = this.buffer.slice(offset, offset + 4).toString();
+  readString(length: number): string {
+    if (this.position + length > this.buffer.length) {
+      throw new Error(
+        `Buffer overflow: Trying to read ${length} bytes at position ${this.position}`
+      );
+    }
+    const str = this.buffer
+      .slice(this.position, this.position + length)
+      .toString("utf8");
+    this.position += length;
+    return str;
+  }
 
-    // Get section length (4 bytes after type)
-    const length = this.buffer.readUInt32BE(offset + 4);
+  readUInt32(): number {
+    if (this.position + 4 > this.buffer.length) {
+      throw new Error(
+        `Buffer overflow: Trying to read 4 bytes at position ${this.position}`
+      );
+    }
+    const value = this.buffer.readUInt32BE(this.position);
+    this.position += 4;
+    return value;
+  }
 
-    return {
-      type,
-      offset,
-      length,
-      children: this.parseChildren(offset + 8, length - 8),
-    };
+  parseSection(offset: number = 0): FFXSection | null {
+    try {
+      this.position = offset;
+
+      if (this.position >= this.buffer.length) {
+        return null;
+      }
+
+      // Read section header
+      const type = this.readString(4);
+      const length = this.readUInt32();
+
+      // Create section
+      const section: FFXSection = {
+        type,
+        offset,
+        length,
+        children: [],
+      };
+
+      // Special handling for RIFX format
+      if (type === "RIFX") {
+        // Read form type (should be 'FaFX')
+        const formType = this.readString(4);
+        section.value = formType;
+
+        // Parse remaining content as children
+        const remainingLength = length - 12; // subtract RIFX(4) + length(4) + formType(4)
+        if (remainingLength > 0) {
+          section.children = this.parseChildren(this.position, remainingLength);
+        }
+      }
+      // Handle head section
+      else if (type === "head") {
+        // Parse head section content
+        section.value = {
+          version: this.readUInt32(),
+          numSections: this.readUInt32(),
+          unknown: this.readUInt32(),
+        };
+      }
+      // Handle LIST sections
+      else if (type === "LIST") {
+        const listType = this.readString(4);
+        section.value = listType;
+
+        const remainingLength = length - 8; // subtract LIST(4) + length(4)
+        if (remainingLength > 0) {
+          section.children = this.parseChildren(this.position, remainingLength);
+        }
+      }
+      // Store raw data for other sections
+      else {
+        section.data = this.buffer.slice(this.position, offset + length);
+        this.position += section.data.length;
+      }
+
+      return section;
+    } catch (error) {
+      console.error(`Error parsing section at offset ${offset}:`, error);
+      return null;
+    }
   }
 
   private parseChildren(start: number, length: number): FFXSection[] {
     const children: FFXSection[] = [];
-    let offset = start;
+    let currentOffset = start;
+    const endOffset = start + length;
 
-    while (offset < start + length) {
-      const section = this.parseSection(offset);
+    // Add safety counter to prevent infinite loops
+    let safetyCounter = 0;
+    const maxSections = 1000; // Adjust this number based on your needs
+
+    while (currentOffset < endOffset && safetyCounter < maxSections) {
+      const section = this.parseSection(currentOffset);
       if (!section) break;
 
+      // Validate section length
+      if (section.length <= 0 || currentOffset + section.length > endOffset) {
+        console.warn(`Invalid child section length at offset ${currentOffset}`);
+        break;
+      }
+
       children.push(section);
-      offset += section.length;
+      currentOffset += section.length;
+      safetyCounter++;
+    }
+
+    if (safetyCounter >= maxSections) {
+      console.warn("Maximum section limit reached, parsing stopped");
     }
 
     return children;
@@ -52,101 +143,75 @@ class FFXStructureAnalyzer {
 
 class FFXAnalyzer {
   private buffer: Buffer;
+  private structureAnalyzer: FFXStructureAnalyzer;
 
   constructor(filePath: string) {
-    // Resolve path relative to dist directory
-    const resolvedPath = path.resolve(__dirname, "../files", filePath);
+    const resolvedPath = path.resolve(__dirname, "../", filePath);
     this.buffer = fs.readFileSync(resolvedPath);
+    this.structureAnalyzer = new FFXStructureAnalyzer(this.buffer);
   }
 
   analyze(): void {
     console.log("File size:", this.buffer.length, "bytes");
 
-    // Print first 32 bytes as hex for header analysis
-    console.log("\nHeader (first 32 bytes):");
-    console.log(
-      this.buffer.slice(0, 32).toString("hex").match(/.{2}/g)?.join(" ")
-    );
+    // Analyze file structure
+    const structure = this.structureAnalyzer.parseSection(0);
 
-    // Try to detect string patterns
-    this.findStrings();
-
-    // Look for common structural patterns
-    this.analyzeStructure();
-  }
-
-  private findStrings(): void {
-    let currentString = "";
-    console.log("\nPossible string contents:");
-
-    for (let i = 0; i < this.buffer.length; i++) {
-      const byte = this.buffer[i];
-      if (byte >= 32 && byte <= 126) {
-        // Printable ASCII range
-        currentString += String.fromCharCode(byte);
-      } else if (currentString.length > 3) {
-        // Only show strings longer than 3 chars
-        console.log(`Offset ${i - currentString.length}: "${currentString}"`);
-        currentString = "";
-      } else {
-        currentString = "";
-      }
+    if (structure) {
+      this.printStructure(structure, 0);
     }
   }
 
-  private analyzeStructure(): void {
-    // Look for repeated patterns or known markers
-    console.log("\nStructural analysis:");
+  private printStructure(section: FFXSection, depth: number): void {
+    const indent = "  ".repeat(depth);
+    console.log(`${indent}Section: ${section.type}`);
+    console.log(`${indent}Offset: ${section.offset}`);
+    console.log(`${indent}Length: ${section.length}`);
 
-    // Common markers to look for
-    const markers = [
-      Buffer.from([0xff, 0xfe]), // UTF-16LE BOM
-      Buffer.from([0xef, 0xbb, 0xbf]), // UTF-8 BOM
-      Buffer.from("RIFX"), // Common AE format marker
-    ];
+    // Print parsed values if available
+    if (section.value !== undefined) {
+      console.log(`${indent}Value:`, section.value);
+    }
 
-    markers.forEach((marker) => {
-      let offset = 0;
-      while ((offset = this.buffer.indexOf(marker, offset)) !== -1) {
-        console.log(`Found marker "${marker.toString()}" at offset: ${offset}`);
-        offset += marker.length;
+    // Print hex dump of the section's data
+    if (section.data) {
+      console.log(`${indent}Data (first 32 bytes):`);
+      console.log(
+        `${indent}${this.formatHexDump(
+          section.data.slice(0, Math.min(32, section.data.length))
+        )}`
+      );
+
+      // Try to interpret as string if it looks like text
+      if (this.looksLikeText(section.data)) {
+        console.log(
+          `${indent}As Text: "${section.data.toString("utf8").trim()}"`
+        );
       }
+    }
+
+    // Recursively print children
+    section.children.forEach((child) => {
+      this.printStructure(child, depth + 1);
     });
+  }
+
+  private formatHexDump(buffer: Buffer): string {
+    return buffer.toString("hex").match(/.{2}/g)?.join(" ") || "";
+  }
+
+  private looksLikeText(buffer: Buffer): boolean {
+    // Simple heuristic: check if the buffer contains mostly printable ASCII characters
+    let printable = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      if (buffer[i] >= 32 && buffer[i] <= 126) {
+        printable++;
+      }
+    }
+    return printable / buffer.length > 0.8;
   }
 }
 
-// Create a test effect
-const testEffect: FFXEffect = {
-  controlName: "Test Effect",
-  matchname: "Custom/Test/Effect",
-  controlArray: [
-    {
-      name: "Slider 1",
-      type: "slider",
-      matchname: "Custom/Slider/1",
-      canHaveKeyframes: true,
-      canBeInvisible: false,
-      id: Math.floor(Math.random() * 1000000000),
-      hold: false,
-      default: 50,
-    },
-    {
-      name: "Color 1",
-      type: "color",
-      matchname: "Custom/Color/1",
-      canHaveKeyframes: true,
-      canBeInvisible: false,
-      id: Math.floor(Math.random() * 1000000000),
-      hold: false,
-      default: { red: 255, green: 0, blue: 0 },
-    },
-  ],
-};
-
-// Create and use the writer
-const writer = new FFXWriter();
-writer.writeFFX(testEffect, "output/pseudo.ffx");
-
-// Run the analyzer on the generated file
-const analyzer = new FFXAnalyzer("output/pseudo.ffx");
+// Run the analyzer
+const analyzer = new FFXAnalyzer("files/test-files/just-one-slider.ffx");
 analyzer.analyze();
